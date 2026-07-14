@@ -284,7 +284,7 @@ class GoogleCalendarService implements Calendar {
           calendarId: selectedCalendar,
           requestBody: payload,
           conferenceDataVersion: 1,
-          sendUpdates: "none",
+          sendUpdates: "all",
         });
         event = eventResponse.data;
         if (event.recurrence) {
@@ -406,7 +406,7 @@ class GoogleCalendarService implements Calendar {
         calendarId: selectedCalendar,
         eventId: uid,
         sendNotifications: true,
-        sendUpdates: "none",
+        sendUpdates: "all",
         requestBody: payload,
         conferenceDataVersion: 1,
       });
@@ -469,8 +469,8 @@ class GoogleCalendarService implements Calendar {
       const event = await calendar.events.delete({
         calendarId: selectedCalendar,
         eventId: uid,
-        sendNotifications: false,
-        sendUpdates: "none",
+        sendNotifications: true,
+        sendUpdates: "all",
       });
       return event?.data;
     } catch (error) {
