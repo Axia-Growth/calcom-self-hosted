@@ -25,8 +25,18 @@ import type {
 import type { CredentialForCalendarService, CredentialPayload } from "@calcom/types/Credential";
 import type { EventResult } from "@calcom/types/EventManager";
 import { sortBy } from "lodash";
+import { alertCalendarSyncFailure } from "./calendarSyncAlert";
 
 const log = logger.getSubLogger({ prefix: ["CalendarManager"] });
+
+/**
+ * Google events carry Cal.com's iCalUID, so the Google adapter can find the event even when the
+ * stored BookingReference.uid is empty. Other adapters still need the uid.
+ */
+const canRecoverMissingEventUid = (
+  credential: { type?: string | null },
+  event: { iCalUID?: string | null }
+) => credential?.type === "google_calendar" && !!event?.iCalUID;
 
 /**
  * Process the calendar event by generating description and removing attendees if needed
@@ -368,6 +378,7 @@ export const createEvent = async (
   const calendar = await getCalendar(credential, "booking");
   let success = true;
   let calError: string | undefined;
+  let createError: unknown;
 
   log.debug(
     "Creating calendar event",
@@ -394,6 +405,7 @@ export const createEvent = async (
         .createEvent(calEvent, credential.id, externalCalendarIdWhenDelegationCredentialIsChosen)
         .catch(async (error: { code: number; calError: string }) => {
           success = false;
+          createError = error;
           /**
            * There is a time when selectedCalendar externalId doesn't match witch certain credential
            * so google returns 404.
@@ -426,6 +438,17 @@ export const createEvent = async (
         calError,
       })
     );
+    if (calendar) {
+      await alertCalendarSyncFailure({
+        action: "create",
+        bookingUid: calEvent.uid,
+        credentialId: credential.id,
+        credentialType: credential.type,
+        startTime: calEvent.startTime,
+        error: createError ?? calError,
+        detail: "Booking is confirmed but the event was NOT written to the host calendar.",
+      });
+    }
   }
   log.debug(
     "Created calendar event",
@@ -475,22 +498,25 @@ export const updateEvent = async (
       calEvent: getPiiFreeCalendarEvent(calEvent),
     })
   );
-  if (bookingRefUid === "") {
+  const recoverMissingUid = !bookingRefUid && canRecoverMissingEventUid(credential, calEvent);
+  if (!bookingRefUid) {
     log.error(
-      "updateEvent failed",
+      recoverMissingUid ? "updateEvent: bookingRefUid is empty, recovering by iCalUID" : "updateEvent failed",
       "bookingRefUid is empty",
       safeStringify({ calEvent: getPiiFreeCalendarEvent(calEvent) })
     );
   }
+  let updateError: unknown;
   const updatedResult: NewCalendarEventType | NewCalendarEventType[] | undefined =
-    calendar && bookingRefUid
+    calendar && (bookingRefUid || recoverMissingUid)
       ? await calendar
-          .updateEvent(bookingRefUid, calEvent, externalCalendarId)
+          .updateEvent(bookingRefUid ?? "", calEvent, externalCalendarId)
           .then((event: NewCalendarEventType | NewCalendarEventType[]) => {
             success = true;
             return event;
           })
           .catch(async (e: { calError: string }) => {
+            updateError = e;
             // @TODO: This code will be off till we can investigate an error with it
             // @see https://github.com/calcom/cal.com/issues/3949
             // await sendBrokenIntegrationEmail(calEvent, "calendar");
@@ -516,6 +542,17 @@ export const updateEvent = async (
         calError,
       })
     );
+    if (calendar && !success) {
+      await alertCalendarSyncFailure({
+        action: "update",
+        bookingUid: calEvent.uid,
+        credentialId: credential.id,
+        credentialType: credential.type,
+        startTime: calEvent.startTime,
+        error: updateError ?? calError ?? (!bookingRefUid ? "bookingRefUid is empty" : undefined),
+        detail: "Reschedule/update did NOT reach the host calendar; the old event may still be there.",
+      });
+    }
   }
 
   if (Array.isArray(updatedResult)) {
@@ -547,7 +584,7 @@ export const deleteEvent = async ({
   event: CalendarEvent;
   externalCalendarId?: string | null;
 }): Promise<unknown> => {
-  if (!bookingRefUid) {
+  if (!bookingRefUid && !canRecoverMissingEventUid(credential, event)) {
     log.error(
       "deleteEvent failed - bookingRefUid is empty, skipping calendar deletion to prevent malformed API request",
       safeStringify({
@@ -566,7 +603,20 @@ export const deleteEvent = async ({
     })
   );
   if (calendar) {
-    return calendar.deleteEvent(bookingRefUid, event, externalCalendarId);
+    try {
+      return await calendar.deleteEvent(bookingRefUid ?? "", event, externalCalendarId);
+    } catch (error) {
+      await alertCalendarSyncFailure({
+        action: "delete",
+        bookingUid: event?.uid,
+        credentialId: credential.id,
+        credentialType: credential.type,
+        startTime: event?.startTime,
+        error,
+        detail: "Cancellation did NOT remove the event from the host calendar.",
+      });
+      throw error;
+    }
   } else {
     log.error(
       "Could not do deleteEvent - No calendar adapter found",
