@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { MeetLocationType } from "@calcom/app-store/constants";
+import { alertCalendarSyncFailure } from "@calcom/features/calendars/lib/calendarSyncAlert";
 import { getDestinationCalendarRepository } from "@calcom/features/di/containers/DestinationCalendar";
 import { SelectedCalendarRepository } from "@calcom/features/selectedCalendar/repositories/SelectedCalendarRepository";
 import { getLocation, getRichDescription } from "@calcom/lib/CalEventParser";
@@ -22,7 +23,6 @@ import type { CredentialForCalendarServiceWithEmail } from "@calcom/types/Creden
 import type { calendar_v3 } from "@googleapis/calendar";
 import type { GaxiosResponse } from "googleapis-common";
 import { RRule } from "rrule";
-
 import { AxiosLikeResponseToFetchResponse } from "../../_utils/oauth/AxiosLikeResponseToFetchResponse";
 import { CalendarAuth } from "./CalendarAuth";
 
@@ -94,6 +94,81 @@ class GoogleCalendarService implements Calendar {
       this.log.warn("Failed to fetch custom calendar reminder", safeStringify(error));
       return null;
     }
+  }
+
+  /**
+   * Finds the live Google event for a booking by its iCalUID.
+   *
+   * Cal.com sets iCalUID on insert and keeps it across reschedules, so this recovers the event when
+   * the stored BookingReference.uid is empty (e.g. the original create threw after Google had already
+   * created the event). Returns null when nothing is found or the lookup itself fails.
+   */
+  private async findEventByICalUID(
+    calendar: calendar_v3.Calendar,
+    calendarId: string,
+    iCalUID?: string | null
+  ): Promise<calendar_v3.Schema$Event | null> {
+    if (!iCalUID) return null;
+    try {
+      const res = await calendar.events.list({ calendarId, iCalUID, showDeleted: false, maxResults: 5 });
+      const match = (res.data.items || []).find((item) => item.id && item.status !== "cancelled");
+      return match ?? null;
+    } catch (error) {
+      this.log.warn("Could not look up Google event by iCalUID", safeStringify({ error, calendarId }));
+      return null;
+    }
+  }
+
+  /**
+   * Sets the Meet link as location/description once Google has created the conference.
+   * Non-fatal: the event already exists at this point, and throwing here used to make Cal.com discard
+   * the Google event id (BookingReference.uid = ""), so later reschedules/cancels never reached Google.
+   */
+  private async patchHangoutLink(
+    calendar: calendar_v3.Calendar,
+    calendarId: string,
+    eventId: string,
+    hangoutLink: string,
+    calEvent: CalendarServiceEvent
+  ) {
+    const requestBody = {
+      description: getRichDescription({
+        ...calEvent,
+        additionalInformation: { hangoutLink },
+      }),
+      location: getLocation({
+        videoCallData: calEvent.videoCallData,
+        additionalInformation: {
+          ...calEvent.additionalInformation,
+          hangoutLink,
+        },
+        location: calEvent.location,
+        uid: calEvent.uid,
+      }),
+    };
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await calendar.events.patch({ calendarId, eventId, requestBody });
+        return;
+      } catch (error) {
+        lastError = error;
+        if (isGaxiosResponse(error)) delete error.config.body;
+        this.log.error(
+          `Failed to set Meet link on Google event (attempt ${attempt})`,
+          safeStringify({ error, calendarId })
+        );
+      }
+    }
+    await alertCalendarSyncFailure({
+      action: "meet-link-patch",
+      bookingUid: calEvent.uid,
+      credentialId: this.credential.id,
+      credentialType: this.integrationName,
+      startTime: calEvent.startTime,
+      error: lastError,
+      detail: "Event exists on Google Calendar but its location/description still lack the Meet link.",
+    });
   }
 
   private getReminders(customReminderMinutes: number | null): {
@@ -280,13 +355,35 @@ class GoogleCalendarService implements Calendar {
           });
         }
       } else {
-        const eventResponse = await calendar.events.insert({
-          calendarId: selectedCalendar,
-          requestBody: payload,
-          conferenceDataVersion: 1,
-          sendUpdates: "all",
-        });
-        event = eventResponse.data;
+        try {
+          const eventResponse = await calendar.events.insert({
+            calendarId: selectedCalendar,
+            requestBody: payload,
+            conferenceDataVersion: 1,
+            sendUpdates: "all",
+          });
+          event = eventResponse.data;
+        } catch (insertError) {
+          // The insert can fail after Google already created the event (e.g. a 409 duplicate iCalUID,
+          // or a dropped response). If the event is there, keep it instead of losing its id.
+          const existing = await this.findEventByICalUID(calendar, selectedCalendar, calEvent.iCalUID);
+          if (!existing?.id) throw insertError;
+          if (isGaxiosResponse(insertError)) delete insertError.config.body;
+          this.log.error(
+            "Google insert threw but the event exists; adopting it",
+            safeStringify({ error: insertError, selectedCalendar, credentialId })
+          );
+          await alertCalendarSyncFailure({
+            action: "create-recovered",
+            bookingUid: calEvent.uid,
+            credentialId,
+            credentialType: this.integrationName,
+            startTime: calEvent.startTime,
+            error: insertError,
+            detail: "Recovered: event found on Google Calendar by iCalUID and kept.",
+          });
+          event = existing;
+        }
         if (event.recurrence) {
           if (event.recurrence.length > 0) {
             recurringEventId = event.id;
@@ -296,26 +393,8 @@ class GoogleCalendarService implements Calendar {
       }
 
       if (event && event.id && event.hangoutLink) {
-        await calendar.events.patch({
-          // Update the same event but this time we know the hangout link
-          calendarId: selectedCalendar,
-          eventId: event.id || "",
-          requestBody: {
-            description: getRichDescription({
-              ...calEvent,
-              additionalInformation: { hangoutLink: event.hangoutLink },
-            }),
-            location: getLocation({
-              videoCallData: calEvent.videoCallData,
-              additionalInformation: {
-                ...calEvent.additionalInformation,
-                hangoutLink: event.hangoutLink,
-              },
-              location: calEvent.location,
-              uid: calEvent.uid,
-            }),
-          },
-        });
+        // Update the same event but this time we know the hangout link
+        await this.patchHangoutLink(calendar, selectedCalendar, event.id, event.hangoutLink, calEvent);
       }
 
       return {
@@ -401,10 +480,23 @@ class GoogleCalendarService implements Calendar {
         ? event.destinationCalendar?.find((cal) => cal.externalId === externalCalendarId)?.externalId
         : undefined) || "primary";
 
+    let eventId = uid;
+    if (!eventId) {
+      const existing = await this.findEventByICalUID(calendar, selectedCalendar, event.iCalUID);
+      if (existing?.id) {
+        this.log.warn("updateEvent: missing Google event id, recovered it by iCalUID");
+        eventId = existing.id;
+      } else {
+        // Nothing on the calendar to update (the original create never landed) -> create it now.
+        this.log.warn("updateEvent: missing Google event id and no event found by iCalUID; creating it");
+        return this.createEvent(event, this.credential.id);
+      }
+    }
+
     try {
       const evt = await calendar.events.update({
         calendarId: selectedCalendar,
-        eventId: uid,
+        eventId,
         sendNotifications: true,
         sendUpdates: "all",
         requestBody: payload,
@@ -417,26 +509,8 @@ class GoogleCalendarService implements Calendar {
       });
 
       if (evt && evt.data.id && evt.data.hangoutLink && event.location === MeetLocationType) {
-        await calendar.events.patch({
-          // Update the same event but this time we know the hangout link
-          calendarId: selectedCalendar,
-          eventId: evt.data.id || "",
-          requestBody: {
-            description: getRichDescription({
-              ...event,
-              additionalInformation: { hangoutLink: evt.data.hangoutLink },
-            }),
-            location: getLocation({
-              videoCallData: event.videoCallData,
-              additionalInformation: {
-                ...event.additionalInformation,
-                hangoutLink: evt.data.hangoutLink,
-              },
-              location: event.location,
-              uid: event.uid,
-            }),
-          },
-        });
+        // Update the same event but this time we know the hangout link
+        await this.patchHangoutLink(calendar, selectedCalendar, evt.data.id, evt.data.hangoutLink, event);
         return {
           uid: "",
           ...evt.data,
@@ -465,10 +539,23 @@ class GoogleCalendarService implements Calendar {
 
     const selectedCalendar = externalCalendarId || "primary";
 
+    let eventId = uid;
+    if (!eventId) {
+      const existing = await this.findEventByICalUID(calendar, selectedCalendar, event?.iCalUID);
+      if (!existing?.id) {
+        this.log.warn(
+          "deleteEvent: missing Google event id and no event found by iCalUID; nothing to delete"
+        );
+        return;
+      }
+      this.log.warn("deleteEvent: missing Google event id, recovered it by iCalUID");
+      eventId = existing.id;
+    }
+
     try {
       const event = await calendar.events.delete({
         calendarId: selectedCalendar,
-        eventId: uid,
+        eventId,
         sendNotifications: true,
         sendUpdates: "all",
       });
